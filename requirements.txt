@@ -1,0 +1,7 @@
+streamlit
+pandas
+faiss-cpu
+sentence-transformers
+sqlalchemy
+openpyxl
+requests
