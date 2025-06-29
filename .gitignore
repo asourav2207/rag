@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+venv/
+chat_history.db
+excel_files/
+*.xlsx
+.DS_Store
