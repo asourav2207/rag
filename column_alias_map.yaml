@@ -1,0 +1,32 @@
+# column_alias_map.yaml
+
+Field Name:
+  - field name
+  - field_name
+  - Field
+  - Column Name
+
+Redshift Element Name:
+  - redshift_element_name
+  - Redshift Column
+  - redshift field
+  - Element Name
+
+Data Length:
+  - data length
+  - length
+  - size
+
+Description:
+  - desc
+  - column description
+
+Programmer Notes:
+  - notes
+  - dev notes
+  - programmer note
+
+Joining Criteria SQL:
+  - join sql
+  - sql join
+  - join condition
