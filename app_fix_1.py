@@ -24,6 +24,7 @@ class ChatHistory(Base):
     timestamp = Column(DateTime)
     feedback = Column(String)
 
+
 engine = create_engine(DB_PATH)
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
