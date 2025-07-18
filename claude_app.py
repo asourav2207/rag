@@ -1,3 +1,6 @@
+# NOTE: Renamed file from 'abc.py' to avoid shadowing the stdlib 'abc' module.
+# Please rename this file to something like 'redshift_rag_app.py' for best practice.
+
 import streamlit as st
 import os
 import pandas as pd
@@ -7,14 +10,14 @@ import numpy as np
 import faiss
 import requests
 import json
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 import base64
 from io import BytesIO
 from openpyxl import load_workbook
 import concurrent.futures
 import re
-from urllib.parse import quote_plus # Import this
+import socket
 
 # ---- App Configuration ----
 st.set_page_config(page_title="Redshift Assistant", layout="wide")
@@ -37,6 +40,9 @@ class ChatSession(Base):
     name = Column(String, default="Untitled Chat")
     mode = Column(String, default="Documentation")
     created_at = Column(DateTime, default=datetime.now)
+    
+    # Relationship to chat history
+    chat_history = relationship("ChatHistory", back_populates="session")
 
 class ChatHistory(Base):
     __tablename__ = 'chat_history'
@@ -47,7 +53,13 @@ class ChatHistory(Base):
     sql_query = Column(Text)
     timestamp = Column(DateTime, default=datetime.now)
     feedback = Column(String)
-    session_id = Column(Integer)
+    session_id = Column(Integer, ForeignKey('chat_session.id'))
+    parent_id = Column(Integer, ForeignKey('chat_history.id'))  # For threaded conversations
+    
+    # Relationships
+    session = relationship("ChatSession", back_populates="chat_history")
+    parent = relationship("ChatHistory", remote_side=[id])
+    children = relationship("ChatHistory", remote_side=[parent_id])
 
 engine = create_engine(DB_PATH)
 Base.metadata.create_all(engine)
@@ -58,14 +70,8 @@ SessionLocal = sessionmaker(bind=engine)
 def get_redshift_engine():
     try:
         creds = st.secrets["redshift"]
-        
-        # URL-encode the password to handle special characters
-        encoded_password = quote_plus(creds['password'])
-
-        conn_string = (
-            f"postgresql+psycopg2://{creds['user']}:{encoded_password}@"
-            f"{creds['host']}:{creds['port']}/{creds['database']}"
-        )
+        # Ensure 'user' and 'host' are correctly parsed from secrets.toml
+        conn_string = f"postgresql+psycopg2://{creds['user']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
         engine = create_engine(conn_string, connect_args={'connect_timeout': 10})
         with engine.connect() as conn:
             st.sidebar.success("Redshift connection successful!")
@@ -135,7 +141,8 @@ def download_excel_from_github(file_info):
     try:
         r = requests.get(file_info["download_url"], timeout=10)
         r.raise_for_status()
-        return pd.read_excel(r.content, engine="openpyxl")
+        # FIX: Wrap r.content in BytesIO for pandas compatibility
+        return pd.read_excel(BytesIO(r.content), engine="openpyxl")
     except Exception as e:
         st.error(f"Error downloading {file_info['name']}: {e}")
         return None
@@ -227,52 +234,6 @@ def load_and_prepare_rag_data():
     row_index.add(np.array(row_embeddings))
     return model, row_index, row_docs, row_metadata, None, [], [] # field_index, field_docs, field_metadata are not used here
 
-def retrieve_relevant_docs(query, model, row_index, row_docs, row_metadata, k=5):
-    if not row_docs: return []
-    
-    # NEW: Query Expansion/Rewriting for better embedding match
-    query_expansion_prompt = f"""Given the user query: "{query}"
-    Generate 2-3 alternative phrasings or related terms that could be used to search documentation.
-    Example:
-    Query: "payment logic"
-    Expanded: "how payments are calculated", "payment rules", "payment process"
-    
-    Expanded:"""
-    
-    # Temporarily using call_ollama, ideally a smaller, faster model or a dedicated API for query expansion.
-    # Note: If Ollama is not running, this will return an error message string, so handle it.
-    expanded_query_raw = call_ollama(query_expansion_prompt, timeout=10) 
-    
-    expanded_queries = []
-    if not expanded_query_raw.startswith("Error contacting Ollama"): # Check if Ollama call was successful
-        expanded_queries = [q.strip() for q in expanded_query_raw.split(',') if q.strip()]
-
-    search_queries = [query] + expanded_queries[:2] # Use original + up to 2 expanded queries
-
-    all_matches = []
-    for q in search_queries:
-        query_emb = model.encode([q])
-        distances, indices = row_index.search(query_emb, k)
-        # Filter by a distance threshold to only include truly relevant docs
-        # The threshold (e.g., 1.0 or 1.5) depends on your embedding model and data
-        for i, dist in zip(indices[0], distances[0]):
-            if dist < 1.0: # Adjust threshold as needed
-                all_matches.append((row_docs[i], row_metadata[i], dist)) # Store distance too for sorting
-
-    # Sort matches by distance (lower is better) and remove duplicates
-    all_matches.sort(key=lambda x: x[2])
-    unique_matches = []
-    seen_content = set()
-    for doc, meta, dist in all_matches:
-        if doc not in seen_content:
-            unique_matches.append((doc, meta))
-            seen_content.add(doc)
-        if len(unique_matches) >= k: # Limit to top k unique matches
-            break
-            
-    return unique_matches
-
-# ---- LLM & Chat Functions ----
 def call_ollama(prompt, timeout=90):
     try:
         response = requests.post("http://127.0.0.1:11434/api/generate",
@@ -282,51 +243,144 @@ def call_ollama(prompt, timeout=90):
     except requests.exceptions.RequestException as e:
         return f"Error contacting Ollama: {e}"
 
-def get_rag_answer(user_query, rag_data, history):
-    model, row_index, row_docs, row_metadata, _, _, _ = rag_data
+def retrieve_relevant_docs(query, model, row_index, row_docs, row_metadata, k=10):
+    """
+    FIXED: Improved document retrieval with better ranking and matching
+    """
+    if not row_docs: return []
+    
+    # Multi-step retrieval approach
+    all_matches = []
+    
+    # Step 1: Direct semantic search
+    query_emb = model.encode([query])
+    distances, indices = row_index.search(query_emb, k * 2)  # Get more candidates initially
+    
+    # Step 2: Keyword-based scoring for better ranking
+    query_keywords = set(re.findall(r'\b\w+\b', query.lower()))
+    
+    for i, dist in zip(indices[0], distances[0]):
+        if i >= len(row_docs):  # Safety check
+            continue
+            
+        doc_content = row_docs[i].lower()
+        metadata = row_metadata[i]
+        
+        # Calculate keyword overlap score
+        doc_keywords = set(re.findall(r'\b\w+\b', doc_content))
+        keyword_overlap = len(query_keywords.intersection(doc_keywords))
+        keyword_score = keyword_overlap / max(len(query_keywords), 1)
+        
+        # Exact substring match bonus
+        exact_match_bonus = 0
+        for keyword in query_keywords:
+            if keyword in doc_content:
+                exact_match_bonus += 1
+        exact_match_score = exact_match_bonus / max(len(query_keywords), 1)
+        
+        # Combined score: lower distance is better, higher keyword scores are better
+        # Normalize distance to 0-1 range and invert it
+        normalized_distance = min(dist / 2.0, 1.0)  # Assuming max reasonable distance is 2.0
+        semantic_score = 1 - normalized_distance
+        
+        # Weighted combination
+        combined_score = (
+            0.4 * semantic_score +
+            0.35 * keyword_score +
+            0.25 * exact_match_score
+        )
+        
+        all_matches.append({
+            'doc': row_docs[i],
+            'metadata': metadata,
+            'combined_score': combined_score,
+            'semantic_score': semantic_score,
+            'keyword_score': keyword_score,
+            'exact_match_score': exact_match_score,
+            'distance': dist
+        })
+    
+    # Sort by combined score (descending - higher is better)
+    all_matches.sort(key=lambda x: x['combined_score'], reverse=True)
+    
+    # Remove duplicates while preserving order
+    unique_matches = []
+    seen_content = set()
+    for match in all_matches:
+        if match['doc'] not in seen_content:
+            unique_matches.append((match['doc'], match['metadata']))
+            seen_content.add(match['doc'])
+        if len(unique_matches) >= k:
+            break
+    
+    # Debug info (optional - can be removed in production)
+    if len(unique_matches) > 0:
+        st.write(f"Debug: Top match scores for query '{query}':")
+        for i, match in enumerate(all_matches[:3]):
+            st.write(f"  Rank {i+1}: Combined={match['combined_score']:.3f}, Semantic={match['semantic_score']:.3f}, "
+                    f"Keyword={match['keyword_score']:.3f}, Exact={match['exact_match_score']:.3f}")
+            
+    return unique_matches[:k]
+
+def get_rag_answer(user_query, rag_data, history, parent_id=None):
+    """
+    FIXED: Improved context usage and LLM prompting
+    """
+    # Unpack only the available values from rag_data (7 values)
+    model, row_index, row_docs, row_metadata, field_index, field_docs, field_metadata = rag_data
     if not model or not row_index or not row_docs or not row_metadata:
         return "Documentation data not loaded or indexed. Please ensure Excel files are uploaded and data is available.", "", None
-
-    # Handle ambiguous queries
+    
+    # Handle ambiguous references
     ambiguous_terms = ["this field", "it", "the field", "that field"]
     if any(term in user_query.lower() for term in ambiguous_terms) and st.session_state.get("last_referenced_field"):
         user_query += f" (referring to {st.session_state.last_referenced_field})"
-
-    matches = retrieve_relevant_docs(user_query, model, row_index, row_docs, row_metadata)
     
-    # Store last referenced field for context
+    # Retrieve relevant documents with improved ranking
+    matches = retrieve_relevant_docs(user_query, model, row_index, row_docs, row_metadata, k=8)
+    
     if matches:
-        # Try to extract a field from the first match for follow-up context
         first_match_content = matches[0][1].get('content', '')
         m = re.search(r"([a-zA-Z0-9_]+)\s*:", first_match_content)
-        if m: st.session_state["last_referenced_field"] = m.group(1)
-
-    # Prepare context for LLM (still plain string, taking top 3 for brevity in prompt)
-    context_for_llm = "\n---\n".join([doc for doc, meta in matches][:3])
-
-    conversation_history = "".join([f"User: {h.question}\nAssistant: {h.answer}\n" for h in history[-2:] if h.answer != "Thinking..."]) # Exclude current "Thinking..." entry
+        if m: 
+            st.session_state["last_referenced_field"] = m.group(1)
     
-    # Refined RAG Prompt for LLM
-    prompt = f"""You are a helpful and precise documentation assistant. Your primary goal is to answer the user's question STRICTLY based on the provided "Documentation Context".
-If the answer is not directly available or cannot be reasonably inferred from the context, you MUST state: "I cannot answer this question based on the provided documentation."
-Do NOT use any outside knowledge or make assumptions. Be concise and direct.
+    # IMPROVED: Use more context and better prompting
+    context_for_llm = "\n---\n".join([doc for doc, meta in matches[:5]])  # Use top 5 matches
+    
+    # Get conversation history
+    conversation_history = ""
+    if history:
+        conversation_history = "".join([f"User: {h.question}\nAssistant: {h.answer}\n" for h in history[-3:] if h.answer != "Thinking..."])
+    
+    # IMPROVED: Better prompt for LLM
+    prompt = f'''You are a helpful documentation assistant. You must carefully examine ALL the provided documentation context to answer the user's question. 
+
+IMPORTANT INSTRUCTIONS:
+1. Read through ALL the documentation entries provided below
+2. Look for ANY field names or information that matches or is related to the user's query
+3. If you find relevant information in ANY of the context entries, use it to answer
+4. Do NOT say you cannot answer if the information exists in the context
+5. Be specific about which fields/tables you found information about
+6. If the exact field name isn't found, mention similar or related fields that might be relevant
 
 Conversation History:
 {conversation_history}
 
-Documentation Context:
+Documentation Context (examine ALL entries):
 {context_for_llm}
 
 User Query: {user_query}
 
-Answer:"""
-    answer = call_ollama(prompt)
+Please provide a comprehensive answer based on the documentation context above. If you find any relevant information, use it to answer the question.
+
+Answer:'''
     
-    # Pass the full matches object as context to save, so it can be rendered later.
-    # We'll JSON dump only the metadata for storage, not the full document string.
+    answer = call_ollama(prompt, timeout=120)  # Increased timeout for better processing
+    
     return answer, json.dumps([m[1] for m in matches]), None
 
-def get_sql_answer(user_query, schema_str, history):
+def get_sql_answer(user_query, schema_str, history, parent_id=None):
     conversation_history = "".join([f"User: {h.question}\nAssistant:\n{h.answer}\n" for h in history[-3:] if h.answer != "Thinking..."])
     prompt = f"""You are an expert Redshift SQL analyst. Convert the user's question into a correct Redshift SQL query using the provided schema and history.
 Conversation History:
@@ -378,16 +432,43 @@ List the follow-up questions as bullet points."""
         except Exception as e:
             return [f"(Error generating suggestions: {e})"]
 
-def save_chat(question, answer, context, sql, session_id):
+def save_chat(question, answer, context, sql, session_id, parent_id=None):
+    """
+    FIXED: Added support for threaded conversations
+    """
     db = SessionLocal()
-    entry = ChatHistory(question=question, answer=answer, context=context, sql_query=sql, session_id=session_id)
-    db.add(entry); db.commit(); db.close()
+    entry = ChatHistory(
+        question=question, 
+        answer=answer, 
+        context=context, 
+        sql_query=sql, 
+        session_id=session_id,
+        parent_id=parent_id
+    )
+    db.add(entry)
+    db.commit()
+    entry_id = entry.id
+    db.close()
+    return entry_id
 
 def get_chat_history(session_id):
+    """
+    FIXED: Get chat history with proper threading support
+    """
     db = SessionLocal()
+    # Get all entries for the session, ordered by timestamp
     entries = db.query(ChatHistory).filter_by(session_id=session_id).order_by(ChatHistory.timestamp).all()
     db.close()
     return entries
+
+def get_chat_thread(parent_id):
+    """
+    New function to get threaded responses for a parent message
+    """
+    db = SessionLocal()
+    thread_entries = db.query(ChatHistory).filter_by(parent_id=parent_id).order_by(ChatHistory.timestamp).all()
+    db.close()
+    return thread_entries
 
 # Initialize session state variables
 if 'selected_session_id' not in st.session_state:
@@ -398,6 +479,8 @@ if 'user_input' not in st.session_state:
     st.session_state.user_input = ""
 if 'rerun_triggered_by_suggestion' not in st.session_state:
     st.session_state.rerun_triggered_by_suggestion = False
+if 'suggestion_parent_id' not in st.session_state:
+    st.session_state.suggestion_parent_id = None
 
 # ---- Main App UI ----
 st.sidebar.title("Controls & Sessions")
@@ -410,12 +493,14 @@ with st.sidebar.form("new_session_form"):
     if st.form_submit_button("Start New Chat") and new_chat_name:
         db = SessionLocal()
         new_session = ChatSession(name=new_chat_name, mode=mode_label)
-        db.add(new_session); db.commit()
+        db.add(new_session)
+        db.commit()
         st.session_state.selected_session_id = new_session.id
         db.close()
         st.session_state.history = [] # Clear history for new session
         st.session_state.user_input = "" # Clear any pending input
         st.session_state.rerun_triggered_by_suggestion = False # Reset
+        st.session_state.suggestion_parent_id = None
         st.rerun()
 
 db = SessionLocal()
@@ -449,6 +534,7 @@ if st.session_state.selected_session_id:
         st.session_state.history = get_chat_history(st.session_state.selected_session_id)
         st.session_state.user_input = "" # Clear input on session change
         st.session_state.rerun_triggered_by_suggestion = False # Reset
+        st.session_state.suggestion_parent_id = None
         st.rerun() # Rerun to refresh chat display with new session's history
 elif not sessions:
     st.sidebar.info("No chat sessions found. Start a new one above!")
@@ -529,7 +615,6 @@ else: # Documentation Mode
                     
                     table_name_from_upload = uploaded_file.name.split('.')[0]
                     suggested_buttons.append(f"Generate sample documentation query for {table_name_from_upload}")
-                    
                     for sugg in suggested_buttons:
                         if st.button(sugg, key=f"suggestion_after_upload_{sugg}"):
                             st.session_state.user_input = sugg
@@ -548,7 +633,6 @@ for i, entry in enumerate(st.session_state.get('history', [])):
         st.markdown(entry.answer)
         if app_mode and entry.sql_query: # Only show SQL query in Redshift mode
             st.code(entry.sql_query, language="sql")
-        
         # Display rich context in Documentation mode
         if not app_mode and entry.context:
             try:
@@ -561,14 +645,15 @@ for i, entry in enumerate(st.session_state.get('history', [])):
                             if meta.get('original_row_data'):
                                 # Convert the single row dictionary to a DataFrame for display
                                 df_row = pd.DataFrame([meta['original_row_data']])
+                                # Ensure all values are strings for Arrow compatibility
+                                df_row = df_row.astype(str)
                                 st.dataframe(df_row.T.rename(columns={0: 'Value'})) # Transpose for better readability of single row
                             else:
                                 st.code(meta.get('content', 'No content available'), language='text')
                             st.markdown("---") # Separator between rows
                 else:
-                     with st.expander("📚 No Specific Documentation Context Retrieved"):
+                    with st.expander("📚 No Specific Documentation Context Retrieved"):
                         st.markdown("The assistant did not find specific documentation rows relevant to this query. It answered based on its general understanding or broad context.")
-
             except json.JSONDecodeError:
                 # Fallback for old entries or if context is not valid JSON
                 with st.expander("📚 Raw Retrieved Context (Legacy)"):
@@ -577,8 +662,6 @@ for i, entry in enumerate(st.session_state.get('history', [])):
                 st.error(f"Error displaying context: {e}")
                 with st.expander("📚 Error Displaying Context"):
                     st.markdown(f"Could not parse context: {entry.context[:100]}...")
-
-
         # Follow-up suggestions for the last message
         if i == len(st.session_state.history) - 1 and entry.answer != "Thinking...": # Only show suggestions for the final answer
             with st.expander("🔎 Follow-up Suggestions"):
@@ -609,7 +692,8 @@ if st.session_state.rerun_triggered_by_suggestion:
 # This allows suggestions to pre-fill the box and trigger a new message.
 user_input_from_chatbox = st.chat_input(
     f"Ask a question... (Mode: {mode_label})", 
-    key="chat_box"
+    key="chat_box", 
+    
 )
 
 # Check if there's new input from the chatbox (user typed something)
@@ -630,7 +714,6 @@ if st.session_state.user_input and st.session_state.selected_session_id:
     # 3. The last answer is not currently "Thinking..." (to prevent re-triggering while a response is being generated)
     if st.session_state.user_input.strip() != "" and \
        (st.session_state.user_input != last_q_in_history or (last_a_in_history and last_a_in_history != "Thinking...")):
-        
         question_to_process = st.session_state.user_input
         # Append a placeholder "Thinking..." message immediately
         st.session_state.history.append(ChatHistory(question=question_to_process, answer="Thinking...", session_id=st.session_state.selected_session_id))
@@ -657,15 +740,12 @@ if st.session_state.get('history') and st.session_state.history[-1].answer == "T
                 answer = "Documentation model not loaded. Please upload Excel files or check configuration."
                 context = ""
                 sql = ""
-        
         # Update the last entry in history with the actual response
         last_entry_placeholder.answer = answer
         last_entry_placeholder.context = context
         last_entry_placeholder.sql_query = sql
-        
         # Save the updated entry to the database
         save_chat(last_entry_placeholder.question, answer, context, sql, st.session_state.selected_session_id)
-        
         # Re-fetch history to ensure the updated entry is reflected and session is consistent
         st.session_state.history = get_chat_history(st.session_state.selected_session_id)
         st.rerun() # Rerun to display the final answer and clear spinner
@@ -684,3 +764,28 @@ if st.session_state.get('history') and app_mode:
                 results_df = run_redshift_query(edited_sql, redshift_engine)
                 if results_df is not None:
                     st.dataframe(results_df)
+
+def redshift_connection_diagnostics():
+    creds = st.secrets["redshift"]
+    host = creds["host"]
+    port = int(creds["port"])
+    st.sidebar.markdown(f"**Redshift Host:** `{host}`")
+    st.sidebar.markdown(f"**Redshift Port:** `{port}`")
+    # Show public IP
+    try:
+        public_ip = requests.get("https://checkip.amazonaws.com", timeout=5).text.strip()
+        st.sidebar.markdown(f"**Your Public IP:** `{public_ip}`")
+    except Exception as e:
+        st.sidebar.warning(f"Could not determine public IP: {e}")
+    # Try socket connection
+    try:
+        s = socket.create_connection((host, port), timeout=5)
+        s.close()
+        st.sidebar.success("Socket connection to Redshift port 5439 succeeded (network path open).")
+    except Exception as e:
+        st.sidebar.error(f"Socket connection to {host}:{port} failed: {e}")
+        st.sidebar.info("If this fails, check AWS Security Group, NACL, and public access settings.")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Redshift Connection Diagnostics"):
+    redshift_connection_diagnostics()

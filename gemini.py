@@ -14,7 +14,7 @@ from io import BytesIO
 from openpyxl import load_workbook
 import concurrent.futures
 import re
-from urllib.parse import quote_plus # Import this
+import socket
 
 # ---- App Configuration ----
 st.set_page_config(page_title="Redshift Assistant", layout="wide")
@@ -58,14 +58,8 @@ SessionLocal = sessionmaker(bind=engine)
 def get_redshift_engine():
     try:
         creds = st.secrets["redshift"]
-        
-        # URL-encode the password to handle special characters
-        encoded_password = quote_plus(creds['password'])
-
-        conn_string = (
-            f"postgresql+psycopg2://{creds['user']}:{encoded_password}@"
-            f"{creds['host']}:{creds['port']}/{creds['database']}"
-        )
+        # Ensure 'user' and 'host' are correctly parsed from secrets.toml
+        conn_string = f"postgresql+psycopg2://{creds['user']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['database']}"
         engine = create_engine(conn_string, connect_args={'connect_timeout': 10})
         with engine.connect() as conn:
             st.sidebar.success("Redshift connection successful!")
@@ -227,20 +221,21 @@ def load_and_prepare_rag_data():
     row_index.add(np.array(row_embeddings))
     return model, row_index, row_docs, row_metadata, None, [], [] # field_index, field_docs, field_metadata are not used here
 
+def call_ollama(prompt, timeout=90):
+    try:
+        response = requests.post("http://127.0.0.1:11434/api/generate",
+            json={"model": "llama3.2", "prompt": prompt, "stream": False}, timeout=timeout)
+        response.raise_for_status() # Corrected: raise_for_status()
+        return response.json().get("response", "").strip()
+    except requests.exceptions.RequestException as e:
+        return f"Error contacting Ollama: {e}"
+
 def retrieve_relevant_docs(query, model, row_index, row_docs, row_metadata, k=5):
     if not row_docs: return []
     
     # NEW: Query Expansion/Rewriting for better embedding match
-    query_expansion_prompt = f"""Given the user query: "{query}"
-    Generate 2-3 alternative phrasings or related terms that could be used to search documentation.
-    Example:
-    Query: "payment logic"
-    Expanded: "how payments are calculated", "payment rules", "payment process"
+    query_expansion_prompt = f"""Given the user query: \"{query}\"\nGenerate 2-3 alternative phrasings or related terms that could be used to search documentation.\nExample:\nQuery: \"payment logic\"\nExpanded: \"how payments are calculated\", \"payment rules\", \"payment process\"\n\nExpanded:"""
     
-    Expanded:"""
-    
-    # Temporarily using call_ollama, ideally a smaller, faster model or a dedicated API for query expansion.
-    # Note: If Ollama is not running, this will return an error message string, so handle it.
     expanded_query_raw = call_ollama(query_expansion_prompt, timeout=10) 
     
     expanded_queries = []
@@ -272,58 +267,24 @@ def retrieve_relevant_docs(query, model, row_index, row_docs, row_metadata, k=5)
             
     return unique_matches
 
-# ---- LLM & Chat Functions ----
-def call_ollama(prompt, timeout=90):
-    try:
-        response = requests.post("http://127.0.0.1:11434/api/generate",
-            json={"model": "llama3.2", "prompt": prompt, "stream": False}, timeout=timeout)
-        response.raise_for_status() # Corrected: raise_for_status()
-        return response.json().get("response", "").strip()
-    except requests.exceptions.RequestException as e:
-        return f"Error contacting Ollama: {e}"
-
 def get_rag_answer(user_query, rag_data, history):
-    model, row_index, row_docs, row_metadata, _, _, _ = rag_data
+    # Unpack only the available values from rag_data (7 values)
+    model, row_index, row_docs, row_metadata, field_index, field_docs, field_metadata = rag_data
     if not model or not row_index or not row_docs or not row_metadata:
         return "Documentation data not loaded or indexed. Please ensure Excel files are uploaded and data is available.", "", None
-
-    # Handle ambiguous queries
     ambiguous_terms = ["this field", "it", "the field", "that field"]
     if any(term in user_query.lower() for term in ambiguous_terms) and st.session_state.get("last_referenced_field"):
         user_query += f" (referring to {st.session_state.last_referenced_field})"
-
     matches = retrieve_relevant_docs(user_query, model, row_index, row_docs, row_metadata)
-    
-    # Store last referenced field for context
     if matches:
-        # Try to extract a field from the first match for follow-up context
         first_match_content = matches[0][1].get('content', '')
         m = re.search(r"([a-zA-Z0-9_]+)\s*:", first_match_content)
         if m: st.session_state["last_referenced_field"] = m.group(1)
-
-    # Prepare context for LLM (still plain string, taking top 3 for brevity in prompt)
+    # 70% context, 30% reasoning prompt
     context_for_llm = "\n---\n".join([doc for doc, meta in matches][:3])
-
-    conversation_history = "".join([f"User: {h.question}\nAssistant: {h.answer}\n" for h in history[-2:] if h.answer != "Thinking..."]) # Exclude current "Thinking..." entry
-    
-    # Refined RAG Prompt for LLM
-    prompt = f"""You are a helpful and precise documentation assistant. Your primary goal is to answer the user's question STRICTLY based on the provided "Documentation Context".
-If the answer is not directly available or cannot be reasonably inferred from the context, you MUST state: "I cannot answer this question based on the provided documentation."
-Do NOT use any outside knowledge or make assumptions. Be concise and direct.
-
-Conversation History:
-{conversation_history}
-
-Documentation Context:
-{context_for_llm}
-
-User Query: {user_query}
-
-Answer:"""
+    conversation_history = "".join([f"User: {h.question}\nAssistant: {h.answer}\n" for h in history[-2:] if h.answer != "Thinking..."])
+    prompt = f'''You are a helpful and precise documentation assistant. Your primary goal is to answer the user's question using about 70% of your answer directly from the provided \"Documentation Context\" and up to 30% from your own reasoning and synthesis. If the answer is not directly available or cannot be reasonably inferred from the context, you MUST state: "I cannot answer this question based on the provided documentation." Be concise and direct, but you may interpret and synthesize as needed for clarity.\n\nConversation History:\n{conversation_history}\n\nDocumentation Context:\n{context_for_llm}\n\nUser Query: {user_query}\n\nAnswer:'''
     answer = call_ollama(prompt)
-    
-    # Pass the full matches object as context to save, so it can be rendered later.
-    # We'll JSON dump only the metadata for storage, not the full document string.
     return answer, json.dumps([m[1] for m in matches]), None
 
 def get_sql_answer(user_query, schema_str, history):
@@ -561,6 +522,8 @@ for i, entry in enumerate(st.session_state.get('history', [])):
                             if meta.get('original_row_data'):
                                 # Convert the single row dictionary to a DataFrame for display
                                 df_row = pd.DataFrame([meta['original_row_data']])
+                                # Ensure all values are strings for Arrow compatibility
+                                df_row = df_row.astype(str)
                                 st.dataframe(df_row.T.rename(columns={0: 'Value'})) # Transpose for better readability of single row
                             else:
                                 st.code(meta.get('content', 'No content available'), language='text')
@@ -609,7 +572,8 @@ if st.session_state.rerun_triggered_by_suggestion:
 # This allows suggestions to pre-fill the box and trigger a new message.
 user_input_from_chatbox = st.chat_input(
     f"Ask a question... (Mode: {mode_label})", 
-    key="chat_box"
+    key="chat_box", 
+    
 )
 
 # Check if there's new input from the chatbox (user typed something)
@@ -684,3 +648,28 @@ if st.session_state.get('history') and app_mode:
                 results_df = run_redshift_query(edited_sql, redshift_engine)
                 if results_df is not None:
                     st.dataframe(results_df)
+
+def redshift_connection_diagnostics():
+    creds = st.secrets["redshift"]
+    host = creds["host"]
+    port = int(creds["port"])
+    st.sidebar.markdown(f"**Redshift Host:** `{host}`")
+    st.sidebar.markdown(f"**Redshift Port:** `{port}`")
+    # Show public IP
+    try:
+        public_ip = requests.get("https://checkip.amazonaws.com", timeout=5).text.strip()
+        st.sidebar.markdown(f"**Your Public IP:** `{public_ip}`")
+    except Exception as e:
+        st.sidebar.warning(f"Could not determine public IP: {e}")
+    # Try socket connection
+    try:
+        s = socket.create_connection((host, port), timeout=5)
+        s.close()
+        st.sidebar.success("Socket connection to Redshift port 5439 succeeded (network path open).")
+    except Exception as e:
+        st.sidebar.error(f"Socket connection to {host}:{port} failed: {e}")
+        st.sidebar.info("If this fails, check AWS Security Group, NACL, and public access settings.")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Redshift Connection Diagnostics"):
+    redshift_connection_diagnostics()

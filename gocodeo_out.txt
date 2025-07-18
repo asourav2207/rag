@@ -1,0 +1,19 @@
+E
+======================================================================
+ERROR: GoCodeo-test_app_v2_ent_save_chat_save_chat (unittest.loader._FailedTest.GoCodeo-test_app_v2_ent_save_chat_save_chat)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: GoCodeo-test_app_v2_ent_save_chat_save_chat
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/lib/python3.13/unittest/loader.py", line 137, in loadTestsFromName
+    module = __import__(module_name)
+  File "/Users/adityasourav/redshift-rag-bot/GoCodeo-test_app_v2_ent_save_chat_save_chat.py", line 6, in <module>
+    from app_v2_ent import save_chat, SessionLocal, ChatHistory
+  File "/Users/adityasourav/redshift-rag-bot/app_v2_ent.py", line 1, in <module>
+    import streamlit as st
+ModuleNotFoundError: No module named 'streamlit'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
