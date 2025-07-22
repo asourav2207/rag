@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+venv/
+chat_history.db
+.DS_Store
+# Ignore secrets file to prevent accidental commits
+multi_agent_app/.streamlit/secrets.toml
+.streamlit/secrets.toml

@@ -1,0 +1,47 @@
+# Core Streamlit and web framework
+streamlit>=1.28.0
+
+# Data processing and analysis
+pandas>=1.5.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+
+# Machine Learning and AI
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.0
+
+# Database connectivity
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# HTTP and API
+requests>=2.28.0
+urllib3
+
+# Async processing
+asyncio
+
+# Utilities
+python-dateutil>=2.8.2
+pytz>=2023.3
+
+# Optional: Enhanced features (install separately if needed)
+# openai>=1.0.0
+# anthropic>=0.7.0
+# langchain>=0.1.0
+
+# Additional dependencies
+sqlparse>=0.4.0
+hashlib
+functools
+base64
+datetime
+json
+re
+threading
+concurrent.futures
+typing
+io
+os
+time
+logging
